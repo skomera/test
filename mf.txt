@@ -1,0 +1,333 @@
+import { Injectable } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { map } from 'rxjs/operators';
+import { ContainerConfiguration } from '@app/services/micro-front-end-configuration/models/micro-front-end.config';
+import {
+    ChangeStatusService,
+    EnvService,
+    MicroFrontEndConfiguration,
+    PlacementArea
+} from '@nextgen/web-care-portal-core-library';
+import { Subject } from 'rxjs';
+import { TimeoutService } from '../timeout/timeout.service';
+
+/**
+ * This class loads the configuration of the available micro front-end applications and the route configurations
+ * of each micro front-end application
+ */
+@Injectable({
+    providedIn: 'root'
+})
+export class MicroFrontEndConfigurationService {
+    private containerConfigurations: ContainerConfiguration[] = [];
+    private microFrontEndConfigurationMap: Map<string, MicroFrontEndConfiguration> = new Map<string, MicroFrontEndConfiguration>();
+    private contextToNameMap: Map<string, string> = new Map<string, string>();
+    private loadedScriptMap: Map<string, boolean> = new Map<string, boolean>();
+    private loadedElementMap: Map<string, HTMLElement> = new Map<string, HTMLElement>();
+    private initialConfigurations: ContainerConfiguration[] = [];
+
+    mfRequest: Subject<any> = new Subject();
+
+    /**
+     * A service factory used to load the configurations and navigation upon application initialization
+     *
+     * @param service a reference to this service
+     */
+    static microFrontEndConfigurationServiceFactory(service: MicroFrontEndConfigurationService, changeStatusService: ChangeStatusService, timeoutService: TimeoutService) {
+        changeStatusService.removeAllStatuses();
+
+        return async () => {
+            await service.loadContainerConfigurations();
+            await service.loadMicroFrontEndConfigurations();
+        };
+    }
+
+    constructor(private http: HttpClient, private envService: EnvService, private timeoutService: TimeoutService) {
+    }
+
+    private injectScript(configurationItem: ContainerConfiguration, resolve?: any, reject?: any) {
+        if (configurationItem && configurationItem.name) {
+            const name = configurationItem.name;
+            const loadedScript: boolean = this.loadedScriptMap.get(name);
+
+            if (!loadedScript) {
+                // get the main content area
+                const mainContent: HTMLElement = document.getElementById('main-content');
+
+                // insert the web component javascript bundle
+                const script = document.createElement('script');
+                script.src = `${configurationItem.getBundlNameUrl()}?v=${configurationItem.version}`;
+                mainContent.appendChild(script);
+
+                this.initializeScriptOnLoadHandler(script, name, resolve);
+                this.initializeScriptOnErrorHandler(script, configurationItem, reject);
+            } else if (resolve) {
+                resolve(true);
+            }
+        } else if (reject) {
+            reject(`The script couldn't be loaded due to an invalid micro front-end configuration`);
+        }
+    }
+
+    private initializeScriptOnLoadHandler(script: HTMLScriptElement, name: string, resolve?: any) {
+        script.onload = () => {
+            this.loadedScriptMap.set(name, true);
+
+            if (resolve) {
+                resolve(true);
+            }
+
+            // insert dependent web component javascript bundles
+            const microFrontEndConfig = this.getMicroFrontEndConfigurationByName(name);
+
+            if (microFrontEndConfig && microFrontEndConfig.dependencies) {
+                microFrontEndConfig.dependencies.forEach((item) => {
+                    const dependentConfiguration = this.getContainerConfigurationByName(item);
+
+                    // prevents configs from loading twice
+                    if (dependentConfiguration && dependentConfiguration.loadOnInit) {
+                        return;
+                    }
+                    this.injectScript(dependentConfiguration);
+                });
+            }
+        };
+    }
+
+    private initializeScriptOnErrorHandler(script: HTMLScriptElement, configurationItem: ContainerConfiguration, reject?: any) {
+        script.onerror = () => {
+            // remove the script element from the DOM
+            script.remove();
+
+            if (reject) {
+                reject(`An error occurred loading ${configurationItem.getBundlNameUrl()}`);
+            }
+        };
+    }
+
+    private injectElement(configurationItem: ContainerConfiguration) {
+        if (!!configurationItem) {
+            const configurationName = configurationItem.name;
+            const loadedElement: HTMLElement = this.loadedElementMap.get(configurationName);
+            if (!configurationItem.loadOnInit) {
+                this.hideElements();
+            }
+
+
+            const microFrontEndConfiguration = this.getMicroFrontEndConfigurationByName(configurationName);
+            const userProfileComponent = microFrontEndConfiguration && microFrontEndConfiguration.placement === PlacementArea.USER_PROFILE;
+            if (userProfileComponent && !loadedElement) {
+                // get the user-profile content area
+                const userProfileLocation: HTMLElement = document.getElementById('hidden-user-profile');
+                const userProfileContent: HTMLElement = document.createElement(configurationName);
+
+                if (userProfileLocation.childElementCount > 0) {
+                    console.error(`User-profile placement already in use ${configurationName}`);
+                    return;
+                }
+                userProfileLocation.appendChild(userProfileContent);
+
+                this.loadedElementMap.set(configurationName, userProfileContent);
+                this.initializeMessageListeners(userProfileContent);
+                return;
+            }
+
+
+            if (!loadedElement) {
+                // get the main content area
+                const mainContent: HTMLElement = document.getElementById('main-content');
+                const webComponent: HTMLElement = document.createElement(configurationName);
+
+                mainContent.appendChild(webComponent);
+                this.loadedElementMap.set(configurationName, webComponent);
+                this.initializeMessageListeners(webComponent);
+            } else {
+                loadedElement.classList.remove('ghost');
+            }
+        }
+    }
+
+    /***** Load MFE Onit *****/
+    loadDefaultMfe() {
+        this.initialConfigurations.forEach(config => {
+            if (config) {
+                this.loadMicroFrontEnd(config);
+            }
+        });
+    }
+
+    private initializeMessageListeners(webComponent: HTMLElement) {
+        // Establish Communication between the Micro Front Ends
+        webComponent.addEventListener('requestMessage', this.communicationEvent);
+        webComponent.addEventListener('responseMessage', this.communicationEvent);
+    }
+
+
+    private communicationEvent = (event: CustomEvent) => {
+        [...this.loadedElementMap.values()].forEach((component) => {
+            if (component.tagName === event.detail.target.toUpperCase()) {
+                component.dispatchEvent(new CustomEvent(`${event.type}Proxy`, { detail: event.detail }));
+            }
+        });
+    }
+
+    private hideElements() {
+        this.loadedElementMap.forEach((element) => {
+            const Mfes = this.initialConfigurations.map(x => x.name.toUpperCase());
+            if (!Mfes.includes(element.tagName.toUpperCase())) {
+                element.classList.add('ghost');
+            }
+        });
+    }
+
+    private normalizeMicroFrontEndConfigurations(configurations: ContainerConfiguration[]): string[] {
+        let configurationNames: string[] = [];
+
+        configurations.forEach((entry: ContainerConfiguration) => {
+            configurationNames.push(entry.name);
+            configurationNames = configurationNames.concat(this.normalizeMicroFrontEndConfigurations(entry.microFrontEnds));
+        });
+
+        return [...new Set(configurationNames)];
+    }
+
+    /**
+     * Loads the micro front-end container configurations
+     */
+    loadContainerConfigurations(): Promise<any> {
+        const url = `${this.envService.get('microFrontEndBaseURL')}micro-front-ends.json`;
+        return this.http.get(url).pipe(map((response: ContainerConfiguration[]) => {
+            return response;
+        })).toPromise().then((configuration: any) => {
+            this.containerConfigurations = ContainerConfiguration.configurationFactory(configuration);
+            return Promise.resolve();
+        }).catch((error: any) => {
+            console.error(error);
+            return Promise.resolve(error);
+        });
+    }
+
+    /**
+     * Loads the micro front-end configurations
+     */
+    loadMicroFrontEndConfigurations(): Promise<any[]> {
+        const promises: Promise<any>[] = [];
+        const frontEndConfigurationNames: string[] = this.normalizeMicroFrontEndConfigurations(this.containerConfigurations);
+        frontEndConfigurationNames.forEach((configurationName: string) => {
+            const containerConfiguration = this.getContainerConfigurationByName(configurationName);
+            if (containerConfiguration) {
+                const configFileUrl = `${containerConfiguration.getConfigFileUrl()}?v=${containerConfiguration.version}`;
+                const promise = this.http.get(configFileUrl).pipe(map((response: MicroFrontEndConfiguration) => {
+                    return response;
+                })).toPromise().then((microFrontEndConfiguration: MicroFrontEndConfiguration) => {
+                    if (microFrontEndConfiguration.loadOnInit) {
+                        this.initialConfigurations.push(containerConfiguration);
+                        containerConfiguration.loadOnInit = true;
+                    }
+                    this.microFrontEndConfigurationMap.set(configurationName, microFrontEndConfiguration);
+
+                    if (microFrontEndConfiguration.context) {
+                        this.contextToNameMap.set(microFrontEndConfiguration.context, containerConfiguration.name);
+                    }
+
+                    if (microFrontEndConfiguration.navigationBarItem && microFrontEndConfiguration.navigationBarItem.route && microFrontEndConfiguration.menuItems && microFrontEndConfiguration.menuItems.length > 0) {
+                        console.warn(`a route, '${microFrontEndConfiguration.navigationBarItem.route}' was set in config.json with context '${microFrontEndConfiguration.context}' on a navigationBarItem that has menuItems -- it will be removed`);
+                        delete microFrontEndConfiguration.navigationBarItem.route;
+                    }
+
+                    return Promise.resolve();
+                }).catch((error) => {
+                    console.error(error);
+                    return Promise.resolve(error);
+                });
+
+                promises.push(promise);
+            } else {
+                console.error(`A container configuration doesn't exist for ${configurationName}`);
+            }
+        });
+
+        return Promise.all(promises);
+    }
+
+    /**
+     * Retrieves the container configuration for the specified micro front-end context
+     *
+     * @param context the context of the micro front-end
+     */
+    getContainerConfigurationByContext(context: string): ContainerConfiguration {
+        const configurationName = this.contextToNameMap.get(context);
+        return this.getContainerConfigurationByName(configurationName);
+    }
+
+    /**
+     * Retrieves the container configuration for the specified micro front-end
+     *
+     * @param name the name of the micro front-end
+     */
+    getContainerConfigurationByName(name: string): ContainerConfiguration {
+        return this.containerConfigurations.find((entry) => {
+            return entry.name === name;
+        });
+    }
+
+    /**
+     * Retrieves the configuration for a micro front-end with the specified name
+     *
+     * @param name the name of the micro front-end
+     */
+    getMicroFrontEndConfigurationByName(name?: string): MicroFrontEndConfiguration {
+        return this.microFrontEndConfigurationMap.get(name);
+    }
+
+    getMicroFrontEndConfigurations(): Map<string, MicroFrontEndConfiguration> {
+        return this.microFrontEndConfigurationMap;
+    }
+
+    /**
+     * Load a micro front-end application by injecting the micro front-end application bundle in a
+     * script tag, and injecting a DOM element for the micro front-end applications web component
+     *
+     * @param configuration the configuration associated with the micro front-end to load
+     */
+    loadMicroFrontEnd(configuration: ContainerConfiguration): Promise<boolean> {
+        const promise = new Promise<boolean>((resolve, reject) => {
+            if (!!configuration) {
+                this.injectScript(configuration, resolve, reject);
+            } else {
+                resolve(false);
+            }
+        });
+
+        promise.then(() => {
+            this.injectElement(configuration);
+        }).catch((error) => {
+            console.error(error);
+        });
+
+        return promise;
+    }
+
+    /**
+     * Load a micro front-end application by injecting the micro front-end application bundle in a
+     * script tag, and injecting a DOM element for the micro front-end applications web component
+     *
+     * @param context the context name associated with the micro front-end to load
+     */
+    loadMicroFrontEndByContext(context: string): Promise<boolean> {
+        const configurationItem = this.getContainerConfigurationByContext(context);
+        this.timeoutService.resetTimeout();
+        return this.loadMicroFrontEnd(configurationItem);
+    }
+
+    /**
+     * Load a micro front-end application by injecting the micro front-end application bundle in a
+     * script tag, and injecting a DOM element for the micro front-end applications web component
+     *
+     * @param name the container configuration name associated with the micro front-end to load
+     */
+    loadMicroFrontEndByName(name: string): Promise<boolean> {
+        const configurationItem = this.getContainerConfigurationByName(name);
+        return this.loadMicroFrontEnd(configurationItem);
+    }
+}
